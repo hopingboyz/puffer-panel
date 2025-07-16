@@ -1,0 +1,150 @@
+name: KVM Ubuntu‑22.04 VM (persistent)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  kvm-vm:
+    runs-on: self-hosted   # host must expose /dev/kvm
+    steps:
+    # ───────────────────────────────────────────────────────────
+    - name: Prep host & VM (idempotent)
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # ----- VARIABLES -----------------------------------------------------
+        VM_NAME="gha-ubuntu22"
+        WORKDIR="/var/lib/vm-images"
+        BASE_IMG="$WORKDIR/ubuntu-22.04-base.qcow2"
+        DISK="$WORKDIR/${VM_NAME}.qcow2"
+        SEED="$WORKDIR/${VM_NAME}-seed.img"
+        SIZE_GB=20
+        RAM_MB=4096
+        CPUS=2
+        IMG_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+        TIMER_UNIT="/etc/systemd/system/${VM_NAME}-reboot.timer"
+        SERVICE_UNIT="/etc/systemd/system/${VM_NAME}-reboot.service"
+        # DHCP address for libvirt default network (first lease)
+        GUEST_IP="192.168.122.100"
+
+        sudo mkdir -p "$WORKDIR"
+        sudo chown "$(id -u):$(id -g)" "$WORKDIR"
+
+        # ----- PACKAGES ------------------------------------------------------
+        if ! command -v qemu-system-x86_64 >/dev/null; then
+          sudo apt update
+          sudo apt install -y qemu-system-x86 qemu-utils libvirt-daemon-system \
+                              libvirt-clients cloud-image-utils openssh-client \
+                              sshpass
+          sudo systemctl enable --now libvirtd
+        fi
+
+        # ----- BASE IMAGE (download once) ------------------------------------
+        if [[ ! -f "$BASE_IMG" ]]; then
+          echo "Downloading Ubuntu cloud image…"
+          wget -qO "$BASE_IMG" "$IMG_URL"
+          qemu-img resize "$BASE_IMG" ${SIZE_GB}G
+        fi
+
+        # ----- DIFFERENCING DISK (persistent) --------------------------------
+        if [[ ! -f "$DISK" ]]; then
+          echo "Creating QCOW2 differencing disk…"
+          qemu-img create -f qcow2 -b "$BASE_IMG" "$DISK"
+        fi
+
+        # ----- CLOUD‑INIT SEED ----------------------------------------------
+        if [[ ! -f "$SEED" ]]; then
+          cat > /tmp/user-data <<'EOF'
+        #cloud-config
+        hostname: gha-vm
+        users:
+          - name: runner
+            sudo: ALL=(ALL) NOPASSWD:ALL
+            groups: users, admin
+            shell: /bin/bash
+            lock_passwd: false
+            plain_text_passwd: "runner"
+        ssh_pwauth: true
+        package_upgrade: true
+        EOF
+          echo "instance-id: iid-${VM_NAME}" > /tmp/meta-data
+          cloud-localds "$SEED" /tmp/user-data /tmp/meta-data
+        fi
+
+        # ----- DEFINE VM IF NEEDED ------------------------------------------
+        if ! sudo virsh dominfo "$VM_NAME" &>/dev/null; then
+          echo "Defining VM $VM_NAME…"
+          sudo virt-install \
+            --name "$VM_NAME" \
+            --memory "$RAM_MB" --vcpus "$CPUS" \
+            --import \
+            --disk path="$DISK",format=qcow2 \
+            --disk path="$SEED",device=cdrom \
+            --network network=default,model=virtio \
+            --os-type linux --os-variant ubuntu22.04 \
+            --noautoconsole
+        fi
+
+        # ----- SYSTEMD TIMER FOR 6‑HOUR REBOOTS -----------------------------
+        if [[ ! -f "$SERVICE_UNIT" ]]; then
+          echo "Creating systemd units for periodic reboot…"
+          sudo tee "$SERVICE_UNIT" >/dev/null <<EOF
+        [Unit]
+        Description=Reboot $VM_NAME safely
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/virsh reboot $VM_NAME --mode=agent
+        EOF
+        fi
+
+        if [[ ! -f "$TIMER_UNIT" ]]; then
+          sudo tee "$TIMER_UNIT" >/dev/null <<EOF
+        [Unit]
+        Description=Reboot $VM_NAME every 6 hours
+
+        [Timer]
+        OnCalendar=*-*-* *:00:00/6
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+        EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now "$(basename "$TIMER_UNIT")"
+        fi
+
+        # ----- START VM ------------------------------------------------------
+        sudo virsh start "$VM_NAME" || true
+
+        # ----- WAIT FOR SSH --------------------------------------------------
+        echo "Waiting for SSH on $GUEST_IP…"
+        for i in {1..40}; do
+          if sshpass -prunner ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 runner@$GUEST_IP 'echo ok' 2>/dev/null; then
+            echo "✅ VM is up"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "❌ Timed out waiting for VM SSH" && exit 1
+
+    # ───────────────────────────────────────────────────────────
+    - name: Do work inside the VM
+      shell: bash
+      run: |
+        GUEST_IP="192.168.122.100"
+        sshpass -prunner ssh -o StrictHostKeyChecking=no runner@$GUEST_IP <<'EOSSH'
+          set -eux
+          echo "Running inside guest at $(hostname) $(date)"
+          # ── Replace the following with your build / test / deploy steps ──
+          sudo apt-get update -qq
+          sudo apt-get install -yqq neofetch
+          neofetch
+        EOSSH
+
+    # ───────────────────────────────────────────────────────────
+    - name: (Optional) shutdown VM when job is done
+      if: always()
+      run: sudo virsh shutdown gha-ubuntu22 || true
